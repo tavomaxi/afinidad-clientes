@@ -16,23 +16,54 @@ warnings.filterwarnings('ignore')
 def cleanup_temp_files():
     """Elimina archivos temporales antiguos al iniciar/cerrar"""
     try:
+        import time
+        current_time = time.time()
+        
+        # Limpiar directorio de Gradio
         gradio_tmp = "/tmp/gradio"
         if os.path.exists(gradio_tmp):
-            # Eliminar carpetas con archivos más antiguos de 1 hora
-            import time
-            current_time = time.time()
             for folder in os.listdir(gradio_tmp):
                 folder_path = os.path.join(gradio_tmp, folder)
                 if os.path.isdir(folder_path):
                     folder_age = current_time - os.path.getmtime(folder_path)
                     if folder_age > 3600:  # 1 hora
                         shutil.rmtree(folder_path, ignore_errors=True)
+        
+        # Limpiar otros archivos temporales
+        for item in os.listdir("/tmp"):
+            if item.startswith("tmp") and item != "gradio":
+                item_path = os.path.join("/tmp", item)
+                try:
+                    if os.path.isdir(item_path):
+                        item_age = current_time - os.path.getmtime(item_path)
+                        if item_age > 3600:
+                            shutil.rmtree(item_path, ignore_errors=True)
+                    elif item_path.endswith(".xlsx"):
+                        item_age = current_time - os.path.getmtime(item_path)
+                        if item_age > 3600:
+                            os.remove(item_path)
+                except Exception:
+                    pass
     except Exception:
         pass
 
 # Registrar limpieza al iniciar y cerrar
 cleanup_temp_files()
 atexit.register(cleanup_temp_files)
+
+# Ejecutar limpieza periódica en background
+def periodic_cleanup():
+    """Ejecuta limpieza cada 30 minutos"""
+    import threading
+    import time
+    def cleanup_loop():
+        while True:
+            time.sleep(1800)  # 30 minutos
+            cleanup_temp_files()
+    thread = threading.Thread(target=cleanup_loop, daemon=True)
+    thread.start()
+
+periodic_cleanup()
 
 def procesar_archivo(archivo, hoja_nombre, max_clientes, umbral_balance, max_iter):
     """
