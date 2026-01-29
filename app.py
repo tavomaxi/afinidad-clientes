@@ -6,13 +6,43 @@ from sklearn.cluster import KMeans
 from sklearn.metrics.pairwise import cosine_similarity
 import random
 import warnings
+import tempfile
+import os
+import atexit
+import shutil
 warnings.filterwarnings('ignore')
 
-def procesar_archivo(archivo, hoja_nombre, max_clientes, umbral_balance, max_iter):
-    """Procesa el archivo Excel y genera grupos de clientes optimizados"""
+# Limpiar archivos temporales al cerrar
+def cleanup_temp_files():
+    """Elimina archivos temporales antiguos al iniciar/cerrar"""
     try:
+        gradio_tmp = "/tmp/gradio"
+        if os.path.exists(gradio_tmp):
+            # Eliminar carpetas con archivos más antiguos de 1 hora
+            import time
+            current_time = time.time()
+            for folder in os.listdir(gradio_tmp):
+                folder_path = os.path.join(gradio_tmp, folder)
+                if os.path.isdir(folder_path):
+                    folder_age = current_time - os.path.getmtime(folder_path)
+                    if folder_age > 3600:  # 1 hora
+                        shutil.rmtree(folder_path, ignore_errors=True)
+    except Exception:
+        pass
+
+# Registrar limpieza al iniciar y cerrar
+cleanup_temp_files()
+atexit.register(cleanup_temp_files)
+
+def procesar_archivo(archivo, hoja_nombre, max_clientes, umbral_balance, max_iter):
+    """
+    Procesa el archivo Excel y genera grupos de clientes optimizados
+    """
+    try:
+        # === 1. CARGAR DATOS ===
         df = pd.read_excel(archivo.name, sheet_name=hoja_nombre)
         
+        # Validaciones
         required_cols = ["Cliente", "Producto", "Cantidad"]
         if not all(col in df.columns for col in required_cols):
             return None, f"❌ Error: El archivo debe contener las columnas: {required_cols}", None
@@ -20,16 +50,20 @@ def procesar_archivo(archivo, hoja_nombre, max_clientes, umbral_balance, max_ite
         if not pd.api.types.is_numeric_dtype(df["Cantidad"]):
             return None, "❌ Error: La columna 'Cantidad' debe contener valores numéricos", None
         
+        # === 2. CREAR MATRIZ ===
         tabla = df.pivot_table(index="Cliente", columns="Producto", values="Cantidad", fill_value=0)
         clientes = tabla.index.tolist()
         n_clientes = len(clientes)
         
+        # === 3. ESCALAR DATOS ===
         scaler = StandardScaler()
         tabla_scaled = scaler.fit_transform(tabla)
         tabla_scaled_df = pd.DataFrame(tabla_scaled, index=clientes)
         
+        # === 4. CALCULAR GRUPOS ===
         n_groups = max(2, (n_clientes + max_clientes - 1) // max_clientes)
         
+        # === 5. FUNCIONES AUXILIARES ===
         def calcular_afinidad_promedio(tabla, clientes_grupo):
             if len(clientes_grupo) < 2:
                 return 0.0
@@ -84,11 +118,13 @@ def procesar_archivo(archivo, hoja_nombre, max_clientes, umbral_balance, max_ite
                 score -= balance_penalty
             return score / n_groups if n_groups > 0 else 0
         
+        # === 6. KMEANS INICIAL ===
         np.random.seed(42)
         kmeans = KMeans(n_clusters=n_groups, random_state=42, n_init=10)
         grupos = kmeans.fit_predict(tabla_scaled)
         cliente_to_grupo = {cliente: grupo for cliente, grupo in zip(clientes, grupos)}
         
+        # Redistribuir
         for grupo in range(n_groups):
             clientes_grupo = [c for c, g in cliente_to_grupo.items() if g == grupo]
             if len(clientes_grupo) > max_clientes:
@@ -99,8 +135,10 @@ def procesar_archivo(archivo, hoja_nombre, max_clientes, umbral_balance, max_ite
                             cliente_to_grupo[cliente] = g
                             break
         
+        # === 7. OPTIMIZACIÓN ===
         suma_total = df["Cantidad"].sum()
         objetivo_suma = suma_total / n_groups
+        
         mejor_configuracion = cliente_to_grupo.copy()
         mejor_score = evaluar_configuracion(tabla, df, cliente_to_grupo)
         
@@ -114,7 +152,10 @@ def procesar_archivo(archivo, hoja_nombre, max_clientes, umbral_balance, max_ite
             
             for cliente in clientes_a_mover:
                 current_grupo = nuevo_grupo[cliente]
-                posibles_grupos = [g for g in range(n_groups) if sum(1 for c, gr in nuevo_grupo.items() if gr == g) < max_clientes]
+                posibles_grupos = [
+                    g for g in range(n_groups)
+                    if sum(1 for c, gr in nuevo_grupo.items() if gr == g) < max_clientes
+                ]
                 if posibles_grupos and len(posibles_grupos) > 1:
                     nuevo_grupo[cliente] = random.choice([g for g in posibles_grupos if g != current_grupo])
             
@@ -135,15 +176,20 @@ def procesar_archivo(archivo, hoja_nombre, max_clientes, umbral_balance, max_ite
             else:
                 max_grupo = max(suma_por_grupo, key=suma_por_grupo.get)
                 min_grupo = min(suma_por_grupo, key=suma_por_grupo.get)
+                
                 clientes_grande = [c for c, g in nuevo_grupo.items() if g == max_grupo]
                 cantidades_clientes = df.groupby("Cliente")["Cantidad"].sum().loc[clientes_grande].to_dict()
                 centroide_chico = tabla_scaled_df.loc[[c for c, g in nuevo_grupo.items() if g == min_grupo]].mean()
+                
                 distancias = np.linalg.norm(tabla_scaled_df.loc[clientes_grande].values - centroide_chico.values, axis=1)
-                clientes_ordenados = [(c, cantidades_clientes[c], distancias[i]) for i, c in enumerate(clientes_grande)]
+                clientes_ordenados = [(c, cantidades_clientes[c], distancias[i]) 
+                                     for i, c in enumerate(clientes_grande)]
                 clientes_ordenados.sort(key=lambda x: (x[1], x[2]))
+                
                 suma_a_mover = (suma_por_grupo[max_grupo] - suma_por_grupo[min_grupo]) / 2
                 suma_movida = 0
                 clientes_a_mover = []
+                
                 for cliente, cantidad, _ in clientes_ordenados:
                     if len([c for c, g in nuevo_grupo.items() if g == min_grupo]) >= max_clientes:
                         break
@@ -152,8 +198,10 @@ def procesar_archivo(archivo, hoja_nombre, max_clientes, umbral_balance, max_ite
                         suma_movida += cantidad
                     if suma_movida >= suma_a_mover * 0.9:
                         break
+                
                 for cliente in clientes_a_mover:
                     nuevo_grupo[cliente] = min_grupo
+                
                 score = evaluar_configuracion(tabla, df, nuevo_grupo)
                 if score > mejor_score:
                     mejor_score = score
@@ -163,6 +211,7 @@ def procesar_archivo(archivo, hoja_nombre, max_clientes, umbral_balance, max_ite
         progreso += f"✅ Optimización completa: {mejoras} mejoras encontradas\n"
         progreso += f"🎯 Score final: {mejor_score:.2f}\n"
         
+        # === 8. PREPARAR RESULTADOS ===
         tabla["Grupo"] = [mejor_configuracion[cliente] for cliente in tabla.index]
         tabla_clientes = df.pivot_table(index="Cliente", columns="Producto", values="Cantidad", fill_value=0)
         tabla_clientes["Grupo"] = tabla["Grupo"]
@@ -185,7 +234,11 @@ def procesar_archivo(archivo, hoja_nombre, max_clientes, umbral_balance, max_ite
                 })
         
         resumen_afinidad = pd.DataFrame(resumen_data)
-        archivo_salida = "GruposResultado_Optimizado.xlsx"
+        
+        # === 9. GUARDAR EXCEL EN DIRECTORIO TEMPORAL ===
+        # Crear archivo temporal que se eliminará automáticamente
+        temp_dir = tempfile.mkdtemp()
+        archivo_salida = os.path.join(temp_dir, "GruposResultado_Optimizado.xlsx")
         
         with pd.ExcelWriter(archivo_salida, engine="xlsxwriter") as writer:
             for grupo in range(n_groups):
@@ -196,12 +249,35 @@ def procesar_archivo(archivo, hoja_nombre, max_clientes, umbral_balance, max_ite
             resumen_afinidad.to_excel(writer, sheet_name="Resumen", index=False)
         
         progreso += f"\n📦 {n_groups} grupos creados exitosamente"
+        
+        # Programar eliminación del archivo después de un tiempo
+        def delete_file_later(filepath):
+            """Elimina el archivo después de 5 minutos"""
+            import threading
+            import time
+            def delete():
+                time.sleep(300)  # 5 minutos
+                try:
+                    if os.path.exists(filepath):
+                        os.remove(filepath)
+                    # Intentar eliminar el directorio temporal también
+                    temp_dir = os.path.dirname(filepath)
+                    if os.path.exists(temp_dir) and not os.listdir(temp_dir):
+                        os.rmdir(temp_dir)
+                except Exception:
+                    pass
+            threading.Thread(target=delete, daemon=True).start()
+        
+        delete_file_later(archivo_salida)
+        
         return archivo_salida, progreso, resumen_afinidad
         
     except Exception as e:
         return None, f"❌ Error: {str(e)}", None
 
+# === CREAR INTERFAZ GRADIO ===
 with gr.Blocks(theme=gr.themes.Soft(), title="Sistema de Agrupación de Clientes") as demo:
+    
     gr.Markdown("""
     # 📊 Sistema de Agrupación de Clientes por Afinidad
     
@@ -214,40 +290,89 @@ with gr.Blocks(theme=gr.themes.Soft(), title="Sistema de Agrupación de Clientes
     
     with gr.Row():
         with gr.Column(scale=1):
-            archivo_input = gr.File(label="📤 Sube tu archivo Excel", file_types=[".xlsx", ".xls"])
+            archivo_input = gr.File(
+                label="📤 Sube tu archivo Excel",
+                file_types=[".xlsx", ".xls"]
+            )
+            
             with gr.Accordion("⚙️ Configuración Avanzada", open=False):
-                hoja_input = gr.Textbox(value="Hoja1", label="Nombre de la hoja")
-                max_clientes_input = gr.Slider(10, 200, 70, 5, label="Máximo de clientes por grupo")
-                umbral_input = gr.Slider(0.05, 0.30, 0.10, 0.05, label="Umbral de balance")
-                iteraciones_input = gr.Slider(50, 300, 100, 10, label="Iteraciones de optimización")
+                hoja_input = gr.Textbox(
+                    value="Hoja1",
+                    label="Nombre de la hoja",
+                    info="Nombre exacto de la hoja en Excel"
+                )
+                max_clientes_input = gr.Slider(
+                    minimum=10,
+                    maximum=200,
+                    value=70,
+                    step=5,
+                    label="Máximo de clientes por grupo"
+                )
+                umbral_input = gr.Slider(
+                    minimum=0.05,
+                    maximum=0.30,
+                    value=0.10,
+                    step=0.05,
+                    label="Umbral de balance",
+                    info="Tolerancia para el balance de cantidades"
+                )
+                iteraciones_input = gr.Slider(
+                    minimum=50,
+                    maximum=300,
+                    value=100,
+                    step=10,
+                    label="Iteraciones de optimización",
+                    info="Más iteraciones = mejor resultado (pero más lento)"
+                )
+            
             procesar_btn = gr.Button("🚀 Procesar Archivo", variant="primary", size="lg")
         
         with gr.Column(scale=1):
-            progreso_output = gr.Textbox(label="📊 Progreso", lines=10)
-            resumen_output = gr.Dataframe(label="📈 Resumen de Grupos")
-            archivo_output = gr.File(label="📥 Descargar Resultado")
+            progreso_output = gr.Textbox(
+                label="📊 Progreso",
+                lines=10,
+                max_lines=15
+            )
+            resumen_output = gr.Dataframe(
+                label="📈 Resumen de Grupos",
+                wrap=True
+            )
+            archivo_output = gr.File(
+                label="📥 Descargar Resultado"
+            )
     
     gr.Markdown("""
     ---
     ### 💡 Interpretación de Resultados:
+    
     - **Afinidad %**: Similaridad promedio entre clientes (mayor es mejor)
     - **Afinidad % Ponderada**: Afinidad considerando volumen de compras
     - **Cantidad Clientes**: Número de clientes en cada grupo
-    - **Productos Únicos**: Diversidad de productos (menor es mejor)
+    - **Productos Únicos**: Diversidad de productos (menor es mejor para cohesión)
     - **Suma Cantidades**: Total de unidades compradas por el grupo
-    """)
-    # Agregar al inicio del archivo (si no está)
-    import tempfile
-    import os
     
-    # Reemplazar la línea del archivo_salida
-    temp_dir = tempfile.mkdtemp()
-    archivo_salida = os.path.join(temp_dir, "GruposResultado_Optimizado.xlsx")
+    ### ✅ Grupos bien balanceados tienen:
+    - Alta afinidad (>15%)
+    - Similar cantidad de clientes
+    - Pocos productos únicos
+    - Cantidades totales equilibradas
+    
+    ---
+    
+    **Desarrollado con ❤️ usando Machine Learning**
+    """)
+    
+    # Conectar función
     procesar_btn.click(
         fn=procesar_archivo,
         inputs=[archivo_input, hoja_input, max_clientes_input, umbral_input, iteraciones_input],
         outputs=[archivo_output, progreso_output, resumen_output]
     )
 
+# Lanzar aplicación
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=False
+    )
